@@ -1,4 +1,12 @@
 # Changelog
+## 0.1.3 - 2026-10-02
+
+### Miscellaneous Tasks
+- Release podpis-rs version 0.1.3
+
+### Refactoring
+- Use rsa crate for PKCS#1 v1.5 verification
+
 ## 0.1.2 - 2026-10-02
 
 ### Features

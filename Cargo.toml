@@ -1,0 +1,20 @@
+[package]
+name = "podpis-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Validate the XAdES-BES enveloping XML signature in a.xml"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "podpis-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+num-bigint = "0.4"
+roxmltree = "0.20"
+sha1 = "0.10"
+sha2 = "0.10"
+x509-parser = "0.16"

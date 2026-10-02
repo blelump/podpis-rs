@@ -12,6 +12,10 @@ pub const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 const TYPE_OBJECT: &str = "http://www.w3.org/2000/09/xmldsig#Object";
 const TYPE_SIGNED_PROPERTIES: &str = "http://uri.etsi.org/01903#SignedProperties";
+const SHA256_URI: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+const SHA512_URI: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
+const TRANSFORM_ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+const TRANSFORM_FILTER2: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
@@ -87,9 +91,17 @@ pub fn validate_str(xml: &str) -> Result<Validation> {
 }
 
 fn check_content_digest(root: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> {
-    let reference = find_reference_by_type(root, TYPE_OBJECT)
-        .ok_or_else(|| anyhow!("no {TYPE_OBJECT} reference found"))?;
+    if let Some(reference) = find_reference_by_type(root, TYPE_OBJECT) {
+        return enveloping_content(root, reference, checks);
+    }
+    let reference = find_enveloped_reference(root)?
+        .ok_or_else(|| anyhow!("no ds:Reference covering the document content found"))?;
+    enveloped_content(root, reference, checks)
+}
 
+/// Reference with `Type="...#Object"` pointing at a `ds:Object` holding the
+/// base64-encoded content (enveloping signature).
+fn enveloping_content(root: Node, reference: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> {
     let uri = reference
         .attribute("URI")
         .ok_or_else(|| anyhow!("object reference has no URI"))?;
@@ -101,7 +113,8 @@ fn check_content_digest(root: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> 
         .decode(object.text().unwrap_or("").trim())
         .context("decoding base64 object content")?;
 
-    let computed = B64.encode(Sha256::digest(&content));
+    let method = child_digest_algorithm(reference);
+    let computed = B64.encode(digest_for(&method, &content)?);
     let expected = child_text(reference, DS, "DigestValue")
         .ok_or_else(|| anyhow!("object reference has no DigestValue"))?;
 
@@ -111,6 +124,104 @@ fn check_content_digest(root: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> 
         expected,
         computed,
     ));
+    Ok(content)
+}
+
+/// Reference with `URI=""` covering the whole document with every embedded
+/// `ds:Signature` removed (enveloped signature, ePUAP "PodpisanyPlik" style).
+fn find_enveloped_reference<'a>(root: Node<'a, 'a>) -> Result<Option<Node<'a, 'a>>> {
+    let Some(reference) = root.descendants().find(|n| {
+        n.is_element()
+            && n.tag_name().name() == "Reference"
+            && n.tag_name().namespace() == Some(DS)
+            && n.attribute("Type").is_none()
+            && n.attribute("URI") == Some("")
+    }) else {
+        return Ok(None);
+    };
+
+    let transforms = child_element(reference, DS, "Transforms")
+        .map(|t| {
+            t.children()
+                .filter(|n| {
+                    n.is_element()
+                        && n.tag_name().name() == "Transform"
+                        && n.tag_name().namespace() == Some(DS)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if transforms.is_empty() {
+        bail!("content reference has no ds:Transforms");
+    }
+    for transform in transforms {
+        match transform.attribute("Algorithm").unwrap_or("") {
+            TRANSFORM_ENVELOPED => {}
+            TRANSFORM_FILTER2 => {
+                let subtracts_signature = transform.descendants().any(|n| {
+                    n.is_element()
+                        && n.tag_name().name() == "XPath"
+                        && n.attribute("Filter") == Some("subtract")
+                        && n.text().is_some_and(|t| t.contains("Signature"))
+                });
+                if !subtracts_signature {
+                    bail!("unsupported xmldsig-filter2 transform");
+                }
+            }
+            other => bail!("unsupported content reference transform: {other}"),
+        }
+    }
+    Ok(Some(reference))
+}
+
+fn enveloped_content(root: Node, reference: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> {
+    let expected = child_text(reference, DS, "DigestValue")
+        .ok_or_else(|| anyhow!("content reference has no DigestValue"))?;
+    let method = child_digest_algorithm(reference);
+
+    let remove_signature = |n: &Node| {
+        n.is_element() && n.tag_name().name() == "Signature" && n.tag_name().namespace() == Some(DS)
+    };
+    // The SignedInfo CanonicalizationMethod says exc-c14n, but ePUAP
+    // "PodpisanyPlik" signers digest the document inclusively; accept either.
+    let signed_doc = exc_c14n_if(root, &remove_signature)?;
+    let signed_doc_inclusive = inclusive_c14n_if(root, &remove_signature)?;
+    let computed_exc = B64.encode(digest_for(&method, &signed_doc)?);
+    let computed_inclusive = B64.encode(digest_for(&method, &signed_doc_inclusive)?);
+
+    let computed = if computed_exc == expected {
+        computed_exc
+    } else {
+        computed_inclusive
+    };
+    checks.push(Check::new(
+        "Reference #1 (enveloped document) digest",
+        computed == expected,
+        expected,
+        computed,
+    ));
+
+    // ePUAP documents carry the payload as base64 attachments; fall back to
+    // the canonical document itself.
+    let mut content: Vec<u8> = root
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "DaneZalacznika")
+        .map(|attachment| -> Result<Vec<u8>> {
+            let text: String = attachment
+                .text()
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            B64.decode(text).context("decoding base64 attachment")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    if content.is_empty() {
+        content = signed_doc;
+    }
     Ok(content)
 }
 
@@ -125,7 +236,10 @@ fn check_signed_properties_digest(root: Node, checks: &mut Vec<Check>) -> Result
     let sp = find_by_id(root, XADES, "SignedProperties", id)
         .ok_or_else(|| anyhow!("no xades:SignedProperties with Id={id}"))?;
 
-    let computed = B64.encode(Sha256::digest(exc_c14n(sp)?));
+    let computed = B64.encode(digest_for(
+        &child_digest_algorithm(reference),
+        &exc_c14n(sp)?,
+    )?);
     let expected = child_text(reference, DS, "DigestValue")
         .ok_or_else(|| anyhow!("SignedProperties reference has no DigestValue"))?;
 
@@ -140,7 +254,7 @@ fn check_signed_properties_digest(root: Node, checks: &mut Vec<Check>) -> Result
 
 fn check_signature(root: Node, cert_der: &[u8], checks: &mut Vec<Check>) -> Result<()> {
     let signed_info =
-        child_element(root, DS, "SignedInfo").ok_or_else(|| anyhow!("no ds:SignedInfo"))?;
+        find_descendant(root, DS, "SignedInfo").ok_or_else(|| anyhow!("no ds:SignedInfo"))?;
     let signature_value =
         find_text(root, DS, "SignatureValue").ok_or_else(|| anyhow!("no ds:SignatureValue"))?;
     let sig = B64
@@ -167,9 +281,13 @@ fn check_cert_digest(root: Node, cert_der: &[u8], checks: &mut Vec<Check>) -> Re
     let expected = child_text(cert_digest, DS, "DigestValue")
         .ok_or_else(|| anyhow!("xades:CertDigest has no DigestValue"))?;
 
-    let computed = B64.encode(Sha512::digest(cert_der));
+    let method = child_element(cert_digest, DS, "DigestMethod")
+        .and_then(|n| n.attribute("Algorithm"))
+        .unwrap_or(SHA512_URI);
+    let hash = method.rsplit('#').next().unwrap_or("sha512");
+    let computed = B64.encode(digest_for(method, cert_der)?);
     checks.push(Check::new(
-        "SigningCertificateV2 certificate digest (SHA-512)",
+        format!("SigningCertificateV2 certificate digest ({hash})"),
         computed == expected,
         expected,
         computed,
@@ -266,6 +384,25 @@ fn digest_with(hash_name: &str, data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Hashes `data` according to a `DigestMethod` algorithm URI.
+pub fn digest_for(algorithm: &str, data: &[u8]) -> Result<Vec<u8>> {
+    match algorithm.rsplit('#').next().unwrap_or("") {
+        "sha1" => Ok(Sha1::digest(data).to_vec()),
+        "sha256" => Ok(Sha256::digest(data).to_vec()),
+        "sha512" => Ok(Sha512::digest(data).to_vec()),
+        other => bail!("unsupported digest algorithm: {other}"),
+    }
+}
+
+/// Algorithm URI of a reference's (or other node's) `ds:DigestMethod` child.
+/// Defaults to SHA-256 for legacy documents without one.
+fn child_digest_algorithm(node: Node) -> String {
+    child_element(node, DS, "DigestMethod")
+        .and_then(|n| n.attribute("Algorithm"))
+        .unwrap_or(SHA256_URI)
+        .to_string()
+}
+
 fn cert_der(root: Node) -> Result<Vec<u8>> {
     let text =
         find_text(root, DS, "X509Certificate").ok_or_else(|| anyhow!("no ds:X509Certificate"))?;
@@ -323,9 +460,27 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn exc_c14n(node: Node) -> Result<Vec<u8>> {
+    c14n(node, &|_| false, false)
+}
+
+/// Canonicalizes like [`exc_c14n`], omitting the subtrees matched by `skip`
+/// (used to strip embedded signatures for enveloped-signature references).
+pub fn exc_c14n_if(node: Node, skip: &dyn Fn(&Node) -> bool) -> Result<Vec<u8>> {
+    c14n(node, skip, false)
+}
+
+/// Exclusive c14n keeps namespace declarations only where they are visibly
+/// utilized; inclusive C14N 1.0 keeps them where the document declares them.
+/// Some signers (e.g. the ePUAP enveloped "PodpisanyPlik" flavor) digest the
+/// document inclusively, so both are offered.
+pub fn inclusive_c14n_if(node: Node, skip: &dyn Fn(&Node) -> bool) -> Result<Vec<u8>> {
+    c14n(node, skip, true)
+}
+
+fn c14n(node: Node, skip: &dyn Fn(&Node) -> bool, inclusive: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut ns_stack: Vec<Vec<(String, String)>> = Vec::new();
-    write_c14n(node, &mut out, &mut ns_stack)?;
+    write_c14n(node, &mut out, &mut ns_stack, skip, inclusive)?;
     Ok(out)
 }
 
@@ -343,14 +498,20 @@ fn write_c14n(
     node: Node,
     out: &mut Vec<u8>,
     ns_stack: &mut Vec<Vec<(String, String)>>,
+    skip: &dyn Fn(&Node) -> bool,
+    inclusive: bool,
 ) -> Result<()> {
     match node.node_type() {
         roxmltree::NodeType::Root => {
             for child in node.children() {
-                write_c14n(child, out, ns_stack)?;
+                write_c14n(child, out, ns_stack, skip, inclusive)?;
             }
         }
-        roxmltree::NodeType::Element => write_element(node, out, ns_stack)?,
+        roxmltree::NodeType::Element => {
+            if !skip(&node) {
+                write_element(node, out, ns_stack, skip, inclusive)?;
+            }
+        }
         roxmltree::NodeType::Text => {
             out.extend_from_slice(escape_text(node.text().unwrap_or("")).as_bytes());
         }
@@ -363,12 +524,14 @@ fn write_element(
     node: Node,
     out: &mut Vec<u8>,
     ns_stack: &mut Vec<Vec<(String, String)>>,
+    skip: &dyn Fn(&Node) -> bool,
+    inclusive: bool,
 ) -> Result<()> {
     let scope: Vec<(String, String)> = in_scope_ns(node);
     let qname = qualified_name(node);
     let parent_scope: Vec<(String, String)> = ns_stack.last().cloned().unwrap_or_default();
 
-    let attr_qnames: Vec<(String, String)> = node
+    let mut attr_qnames: Vec<(String, String)> = node
         .attributes()
         .filter(|a| a.name() != "xmlns" && !a.name().starts_with("xmlns:"))
         .map(|a| {
@@ -381,29 +544,41 @@ fn write_element(
             (ns_uri, qn)
         })
         .collect();
+    // Canonical XML sorts attributes by (namespace URI, local name).
+    attr_qnames.sort();
 
-    let mut used: Vec<String> = Vec::new();
-    used.push(prefix_of(&qname));
-    for (ns_uri, _) in &attr_qnames {
-        if let Some(p) = scope.iter().find(|(_, u)| u == ns_uri) {
-            used.push(p.0.clone());
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    if inclusive {
+        // C14N 1.0: output namespace declarations where the document declares
+        // them, not where they are first visibly utilized.
+        let parent: Vec<(String, String)> = node.parent().map(in_scope_ns).unwrap_or_default();
+        emitted = in_scope_ns(node)
+            .into_iter()
+            .filter(|binding| !parent.contains(binding))
+            .collect();
+    } else {
+        let mut used: Vec<String> = Vec::new();
+        used.push(prefix_of(&qname));
+        for (ns_uri, _) in &attr_qnames {
+            if let Some(p) = scope.iter().find(|(_, u)| u == ns_uri) {
+                used.push(p.0.clone());
+            }
         }
-    }
-    used.sort();
-    used.dedup();
+        used.sort();
+        used.dedup();
 
+        for prefix in &used {
+            if let Some((_, uri)) = scope.iter().find(|(p, _)| p == prefix) {
+                if !parent_scope.iter().any(|(p, u)| p == prefix && u == uri) {
+                    emitted.push((prefix.clone(), uri.clone()));
+                }
+            }
+        }
+        emitted.sort();
+    }
     out.extend_from_slice(b"<");
     out.extend_from_slice(qname.as_bytes());
 
-    let mut emitted: Vec<(String, String)> = Vec::new();
-    for prefix in &used {
-        if let Some((_, uri)) = scope.iter().find(|(p, _)| p == prefix) {
-            if !parent_scope.iter().any(|(p, u)| p == prefix && u == uri) {
-                emitted.push((prefix.clone(), uri.clone()));
-            }
-        }
-    }
-    emitted.sort();
     for (prefix, uri) in &emitted {
         if prefix.is_empty() {
             out.extend_from_slice(b" xmlns=\"");
@@ -441,7 +616,7 @@ fn write_element(
         out.extend_from_slice(format!("</{qname}>").as_bytes());
     } else {
         for child in node.children() {
-            write_c14n(child, out, ns_stack)?;
+            write_c14n(child, out, ns_stack, skip, inclusive)?;
         }
         out.extend_from_slice(format!("</{qname}>").as_bytes());
     }

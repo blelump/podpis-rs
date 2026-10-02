@@ -2,11 +2,16 @@
 
 Verifies the signature of [podpis.gov.pl](https://podpis.gov.pl) artifacts.
 
+Supports both flavors of ePUAP XAdES-BES signatures:
+
+- enveloping — the content is a base64 blob inside a `ds:Object`
+- enveloped — ePUAP "PodpisanyPlik" style, where the `ds:Reference` with
+  `URI=""` covers the whole document with the embedded `ds:Signature`
+  removed (via `xmldsig-filter2` or the `enveloped-signature` transform)
+
 ```console
 $ podpis-rs [path/to/doc.xml]
 ```
-
-Exit code is `0` when all checks pass, `1` otherwise.
 
 ## Development
 
@@ -16,10 +21,6 @@ $ cargo run -- a.xml
 $ cargo clippy --all-targets -- -D warnings
 $ cargo fmt --all
 ```
-
-Releases are tag-driven; pushing `vX.Y.Z` (matching `Cargo.toml`) builds
-binaries and publishes a GitHub release with a changelog generated from
-Conventional Commits.
 
 ## License
 

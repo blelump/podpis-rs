@@ -2,7 +2,7 @@
 name = "podpis-rs"
 version = "0.1.1"
 edition = "2021"
-description = "Validate XAdES-BES enveloping XML signatures (podpis.gov.pl style)"
+description = "Validate XAdES-BES enveloping and enveloped XML signatures (podpis.gov.pl style)"
 license = "MIT"
 repository = "https://github.com/blelump/podpis-rs"
 readme = "README.md"

@@ -1,12 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use num_bigint::BigUint;
 use roxmltree::{Document, Node};
+use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::signature::hazmat::PrehashVerifier;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use x509_parser::prelude::*;
-use x509_parser::public_key::PublicKey;
 
 pub const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
@@ -99,8 +100,6 @@ fn check_content_digest(root: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> 
     enveloped_content(root, reference, checks)
 }
 
-/// Reference with `Type="...#Object"` pointing at a `ds:Object` holding the
-/// base64-encoded content (enveloping signature).
 fn enveloping_content(root: Node, reference: Node, checks: &mut Vec<Check>) -> Result<Vec<u8>> {
     let uri = reference
         .attribute("URI")
@@ -127,8 +126,6 @@ fn enveloping_content(root: Node, reference: Node, checks: &mut Vec<Check>) -> R
     Ok(content)
 }
 
-/// Reference with `URI=""` covering the whole document with every embedded
-/// `ds:Signature` removed (enveloped signature, ePUAP "PodpisanyPlik" style).
 fn find_enveloped_reference<'a>(root: Node<'a, 'a>) -> Result<Option<Node<'a, 'a>>> {
     let Some(reference) = root.descendants().find(|n| {
         n.is_element()
@@ -182,8 +179,6 @@ fn enveloped_content(root: Node, reference: Node, checks: &mut Vec<Check>) -> Re
     let remove_signature = |n: &Node| {
         n.is_element() && n.tag_name().name() == "Signature" && n.tag_name().namespace() == Some(DS)
     };
-    // The SignedInfo CanonicalizationMethod says exc-c14n, but ePUAP
-    // "PodpisanyPlik" signers digest the document inclusively; accept either.
     let signed_doc = exc_c14n_if(root, &remove_signature)?;
     let signed_doc_inclusive = inclusive_c14n_if(root, &remove_signature)?;
     let computed_exc = B64.encode(digest_for(&method, &signed_doc)?);
@@ -201,8 +196,6 @@ fn enveloped_content(root: Node, reference: Node, checks: &mut Vec<Check>) -> Re
         computed,
     ));
 
-    // ePUAP documents carry the payload as base64 attachments; fall back to
-    // the canonical document itself.
     let mut content: Vec<u8> = root
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "DaneZalacznika")
@@ -260,19 +253,70 @@ fn check_signature(root: Node, cert_der: &[u8], checks: &mut Vec<Check>) -> Resu
     let sig = B64
         .decode(signature_value.trim())
         .context("decoding SignatureValue")?;
+    let sig = Signature::try_from(sig.as_slice()).context("decoding PKCS#1 v1.5 signature")?;
 
-    let key = rsa_public_key(cert_der)?;
+    let (_, cert) = X509Certificate::from_der(cert_der).context("parsing signing certificate")?;
+    let key = rsa::RsaPublicKey::from_public_key_der(cert.public_key().raw)
+        .map_err(|err| anyhow!("invalid RSA public key: {err}"))?;
+
     let sig_method = child_element(signed_info, DS, "SignatureMethod")
         .and_then(|n| n.attribute("Algorithm"))
         .ok_or_else(|| anyhow!("no ds:SignatureMethod"))?;
     let hash_name = sig_method.rsplit('-').next().unwrap_or("sha256");
 
+    let message = exc_c14n(signed_info)?;
+    let result = match hash_name {
+        "sha1" => verify_pkcs1v15::<Sha1>(&key, &sig, &message, hash_name),
+        "sha256" => verify_pkcs1v15::<Sha256>(&key, &sig, &message, hash_name),
+        "sha512" => verify_pkcs1v15::<Sha512>(&key, &sig, &message, hash_name),
+        other => bail!("unsupported hash: {other}"),
+    };
+
     let name = format!("SignatureValue (RSA PKCS#1 v1.5 / {hash_name})");
-    match verify_pkcs1v15(&key, &sig, &exc_c14n(signed_info)?, hash_name) {
+    match result {
         Ok(()) => checks.push(Check::new(name, true, "", "")),
         Err(err) => checks.push(Check::new(name, false, "", err.to_string())),
     }
     Ok(())
+}
+
+fn verify_pkcs1v15<D>(
+    key: &rsa::RsaPublicKey,
+    sig: &Signature,
+    message: &[u8],
+    hash_name: &str,
+) -> Result<()>
+where
+    D: Digest,
+    VerifyingKey<D>: PrehashVerifier<Signature>,
+{
+    let digest = D::digest(message);
+    let vkey = VerifyingKey::<D>::new_unprefixed(key.clone());
+    for null_params in [true, false] {
+        let mut digest_info = digest_info_prefix(hash_name, null_params)?;
+        digest_info.extend_from_slice(&digest);
+        if vkey.verify_prehash(&digest_info, sig).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("digest mismatch or invalid padding")
+}
+
+fn digest_info_prefix(hash_name: &str, null_params: bool) -> Result<Vec<u8>> {
+    let (oid, digest_len) = match hash_name {
+        "sha1" => ("06052b0e03021a", 20),
+        "sha256" => ("0609608648016503040201", 32),
+        "sha512" => ("0609608648016503040203", 64),
+        other => bail!("unsupported hash: {other}"),
+    };
+    let params = if null_params { "0500" } else { "" };
+    let alg_len = oid.len() / 2 + params.len() / 2;
+    let di_len = 2 + alg_len + 2 + digest_len;
+    let hex = format!("30{di_len:02x}30{alg_len:02x}{oid}{params}04{digest_len:02x}");
+    Ok((0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex constant"))
+        .collect())
 }
 
 fn check_cert_digest(root: Node, cert_der: &[u8], checks: &mut Vec<Check>) -> Result<()> {
@@ -295,96 +339,6 @@ fn check_cert_digest(root: Node, cert_der: &[u8], checks: &mut Vec<Check>) -> Re
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub struct RsaPublicKey {
-    pub n: BigUint,
-    pub e: BigUint,
-}
-
-pub fn rsa_public_key(cert_der: &[u8]) -> Result<RsaPublicKey> {
-    let (_, cert) = X509Certificate::from_der(cert_der).context("parsing signing certificate")?;
-    let rsa = cert
-        .public_key()
-        .parsed()
-        .context("parsing subject public key info")?;
-    let rsa = match rsa {
-        PublicKey::RSA(k) => k,
-        other => bail!("unsupported public key type: {other:?}"),
-    };
-    Ok(RsaPublicKey {
-        n: BigUint::from_bytes_be(rsa.modulus),
-        e: BigUint::from_bytes_be(rsa.exponent),
-    })
-}
-
-pub fn verify_pkcs1v15(
-    key: &RsaPublicKey,
-    sig: &[u8],
-    message: &[u8],
-    hash_name: &str,
-) -> Result<()> {
-    let k = (key.n.bits() as usize).div_ceil(8);
-    if sig.len() != k {
-        bail!(
-            "signature length {} does not match modulus length {}",
-            sig.len(),
-            k
-        );
-    }
-
-    let mut block = BigUint::from_bytes_be(sig)
-        .modpow(&key.e, &key.n)
-        .to_bytes_be();
-    if block.len() < k {
-        let mut padded = vec![0u8; k - block.len()];
-        padded.extend_from_slice(&block);
-        block = padded;
-    }
-
-    if block.len() < 3 || block[0] != 0x00 || block[1] != 0x01 {
-        bail!("invalid PKCS#1 v1.5 padding header");
-    }
-    let sep = block[2..]
-        .iter()
-        .position(|&b| b == 0x00)
-        .map(|i| i + 2)
-        .ok_or_else(|| anyhow!("no 0x00 separator in PKCS#1 v1.5 block"))?;
-    let digest_info = &block[sep + 1..];
-
-    let digest_len = match hash_name {
-        "sha1" => 20,
-        "sha256" => 32,
-        "sha512" => 64,
-        other => bail!("unsupported hash: {other}"),
-    };
-    if digest_info.len() < digest_len {
-        bail!(
-            "DigestInfo too short: {} bytes, need {digest_len}",
-            digest_info.len()
-        );
-    }
-    let embedded = &digest_info[digest_info.len() - digest_len..];
-
-    let computed = digest_with(hash_name, message);
-    if embedded != computed.as_slice() {
-        bail!(
-            "digest mismatch (embedded={}, computed={})",
-            hex(embedded),
-            hex(&computed)
-        );
-    }
-    Ok(())
-}
-
-fn digest_with(hash_name: &str, data: &[u8]) -> Vec<u8> {
-    match hash_name {
-        "sha1" => Sha1::digest(data).to_vec(),
-        "sha512" => Sha512::digest(data).to_vec(),
-        _ => Sha256::digest(data).to_vec(),
-    }
-}
-
-/// Hashes `data` according to a `DigestMethod` algorithm URI.
 pub fn digest_for(algorithm: &str, data: &[u8]) -> Result<Vec<u8>> {
     match algorithm.rsplit('#').next().unwrap_or("") {
         "sha1" => Ok(Sha1::digest(data).to_vec()),
@@ -394,8 +348,6 @@ pub fn digest_for(algorithm: &str, data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// Algorithm URI of a reference's (or other node's) `ds:DigestMethod` child.
-/// Defaults to SHA-256 for legacy documents without one.
 fn child_digest_algorithm(node: Node) -> String {
     child_element(node, DS, "DigestMethod")
         .and_then(|n| n.attribute("Algorithm"))
@@ -451,28 +403,14 @@ pub fn find_text(root: Node, ns: &str, name: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
 pub fn exc_c14n(node: Node) -> Result<Vec<u8>> {
     c14n(node, &|_| false, false)
 }
 
-/// Canonicalizes like [`exc_c14n`], omitting the subtrees matched by `skip`
-/// (used to strip embedded signatures for enveloped-signature references).
 pub fn exc_c14n_if(node: Node, skip: &dyn Fn(&Node) -> bool) -> Result<Vec<u8>> {
     c14n(node, skip, false)
 }
 
-/// Exclusive c14n keeps namespace declarations only where they are visibly
-/// utilized; inclusive C14N 1.0 keeps them where the document declares them.
-/// Some signers (e.g. the ePUAP enveloped "PodpisanyPlik" flavor) digest the
-/// document inclusively, so both are offered.
 pub fn inclusive_c14n_if(node: Node, skip: &dyn Fn(&Node) -> bool) -> Result<Vec<u8>> {
     c14n(node, skip, true)
 }
@@ -544,13 +482,10 @@ fn write_element(
             (ns_uri, qn)
         })
         .collect();
-    // Canonical XML sorts attributes by (namespace URI, local name).
     attr_qnames.sort();
 
     let mut emitted: Vec<(String, String)> = Vec::new();
     if inclusive {
-        // C14N 1.0: output namespace declarations where the document declares
-        // them, not where they are first visibly utilized.
         let parent: Vec<(String, String)> = node.parent().map(in_scope_ns).unwrap_or_default();
         emitted = in_scope_ns(node)
             .into_iter()

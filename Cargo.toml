@@ -1,6 +1,6 @@
 [package]
 name = "podpis-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Validate XAdES-BES enveloping and enveloped XML signatures (podpis.gov.pl style)"
 license = "MIT"

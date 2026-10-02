@@ -1,5 +1,8 @@
 # cargo-release configuration
 # https://github.com/crate-ci/cargo-release
 #
-# The changelog is owned by CI: the release workflow regenerates and commits
-# CHANGELOG.md when a v* tag is pushed. Here we only bump, commit, tag and push.
+# Publishing and the changelog are owned by CI:
+#   * the release workflow regenerates and commits CHANGELOG.md on a v* tag,
+#   * the release workflow's publish job uploads to crates.io.
+# Locally, cargo-release only bumps the version, commits and pushes the tag.
+publish = false

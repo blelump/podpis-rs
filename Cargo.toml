@@ -2,12 +2,21 @@
 name = "podpis-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Validate the XAdES-BES enveloping XML signature in a.xml"
-license = "MIT OR Apache-2.0"
+description = "Validate XAdES-BES enveloping XML signatures (podpis.gov.pl style)"
+license = "MIT"
+repository = "https://github.com/blelump/podpis-rs"
+readme = "README.md"
+rust-version = "1.85"
+keywords = ["xades", "xml-signature", "xmldsig", "signature", "cryptography"]
+categories = ["command-line-utilities", "cryptography"]
 
 [[bin]]
 name = "podpis-rs"
 path = "src/main.rs"
+
+[lib]
+name = "podpis_rs"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"

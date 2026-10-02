@@ -1,5 +1,11 @@
 # Changelog
-## Unreleased
+## 0.1.2 - 2026-10-02
+
+### Features
+- Add support for enveloped signature
+
+### Miscellaneous Tasks
+- Release podpis-rs version 0.1.2
 
 ### Other
 - Exec release on GH

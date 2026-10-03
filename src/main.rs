@@ -56,10 +56,7 @@ fn main() -> ExitCode {
             if let Some(t) = &v.signing_time {
                 println!("Signing time        : {t}");
             }
-            println!(
-                "Signed content      : {}",
-                describe_content(&v.content)
-            );
+            println!("Signed content      : {}", describe_content(&v.content));
 
             if let Some(out) = &args.extract {
                 if let Err(err) = std::fs::write(out, &v.content) {

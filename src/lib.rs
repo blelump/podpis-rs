@@ -9,6 +9,8 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use x509_parser::prelude::*;
 
+mod pdf;
+
 pub const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 const TYPE_OBJECT: &str = "http://www.w3.org/2000/09/xmldsig#Object";
@@ -60,9 +62,13 @@ impl Validation {
 }
 
 pub fn validate(path: &std::path::Path) -> Result<Validation> {
-    let xml =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    validate_str(&xml)
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if data.starts_with(b"%PDF-") {
+        return pdf::validate_pdf(&data);
+    }
+    let xml = std::str::from_utf8(&data)
+        .map_err(|_| anyhow!("{} is not an XML or PDF file", path.display()))?;
+    validate_str(xml)
 }
 
 pub fn validate_str(xml: &str) -> Result<Validation> {
@@ -280,7 +286,7 @@ fn check_signature(root: Node, cert_der: &[u8], checks: &mut Vec<Check>) -> Resu
     Ok(())
 }
 
-fn verify_pkcs1v15<D>(
+pub(crate) fn verify_pkcs1v15<D>(
     key: &rsa::RsaPublicKey,
     sig: &Signature,
     message: &[u8],

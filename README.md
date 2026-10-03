@@ -10,7 +10,8 @@ Supports both flavors of ePUAP XAdES-BES signatures:
   removed (via `xmldsig-filter2` or the `enveloped-signature` transform)
 
 ```console
-$ podpis-rs [path/to/doc.xml]
+$ podpis-rs [path/to/doc.xml-or-pdf]
+$ podpis-rs --extract out.pdf doc.pdf
 ```
 
 ## Development

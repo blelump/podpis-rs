@@ -1,4 +1,15 @@
 # Changelog
+## 0.2.0 - 2026-10-03
+
+### Bug Fixes
+- Dont display BLOB content
+
+### Features
+- Support PAdES
+
+### Miscellaneous Tasks
+- Release podpis-rs version 0.2.0
+
 ## 0.1.3 - 2026-10-02
 
 ### Miscellaneous Tasks

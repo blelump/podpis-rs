@@ -12,6 +12,23 @@ use podpis_rs::validate;
 struct Args {
     #[arg(default_value = "a.xml")]
     path: std::path::PathBuf,
+    #[arg(long, short, value_name = "FILE")]
+    extract: Option<std::path::PathBuf>,
+}
+
+fn describe_content(content: &[u8]) -> String {
+    match std::str::from_utf8(content) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            let preview: String = trimmed.chars().take(120).collect();
+            if trimmed.chars().count() > 120 {
+                format!("text, {} bytes: {preview}…", content.len())
+            } else {
+                format!("text, {} bytes: {preview}", content.len())
+            }
+        }
+        Err(_) => format!("binary, {} bytes (use --extract to save)", content.len()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -40,9 +57,17 @@ fn main() -> ExitCode {
                 println!("Signing time        : {t}");
             }
             println!(
-                "Signed content      : {:?}",
-                String::from_utf8_lossy(&v.content)
+                "Signed content      : {}",
+                describe_content(&v.content)
             );
+
+            if let Some(out) = &args.extract {
+                if let Err(err) = std::fs::write(out, &v.content) {
+                    eprintln!("error: writing {}: {err:#}", out.display());
+                    return ExitCode::FAILURE;
+                }
+                println!("Extracted content  -> {}", out.display());
+            }
 
             if v.all_passed() {
                 println!("\n=== ALL SIGNATURE CHECKS PASSED ===");

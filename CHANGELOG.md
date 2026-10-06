@@ -1,4 +1,12 @@
 # Changelog
+## 0.2.1 - 2026-10-06
+
+### Miscellaneous Tasks
+- Release podpis-rs version 0.2.1
+
+### Refactoring
+- Keep pades/xades nming
+
 ## 0.2.0 - 2026-10-03
 
 ### Bug Fixes

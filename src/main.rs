@@ -7,7 +7,7 @@ use podpis_rs::validate;
 #[command(
     name = "podpis-rs",
     version,
-    about = "Validate XAdES-BES enveloping XML signatures"
+    about = "Validate XAdES (XML) and PAdES (PDF) signatures"
 )]
 struct Args {
     #[arg(default_value = "a.xml")]

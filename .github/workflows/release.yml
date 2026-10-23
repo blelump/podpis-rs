@@ -47,7 +47,7 @@ jobs:
           else
             shasum -a 256 "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
           fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: podpis-rs-${{ matrix.target }}
           path: |
@@ -91,7 +91,7 @@ jobs:
         env:
           OUTPUT: RELEASE_NOTES.md
           GITHUB_REPO: ${{ github.repository }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: podpis-rs-*
